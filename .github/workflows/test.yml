@@ -1,0 +1,195 @@
+# CI/CD for Tauri v2 — Git Flow Edition
+# ────────────────────────────────────────────────────────────────
+# Branch strategy
+#   • feature/*  → short‑lived work branches
+#   • dev        → integration branch (beta channel)
+#   • release/*  → hard‑freeze / release‑candidate branches (rc channel)
+#   • main       → production (stable channel)
+#
+# Workflow stages
+#   1.   validate   — lint / test on every push & PR
+#   2.   release    — semantic‑release on dev / release/* / main (beta ▸ rc ▸ stable)
+#   3.   build      — cross‑platform Tauri bundles when a tag is produced
+#   4.   publish    — attach artefacts to the GitHub Release (pre‑release flag auto‑set)
+#
+# Adjust PNPM_VERSION, NODE_VERSION, and the Rust toolchain as needed.
+
+name: CI & Release
+
+on:
+  push:
+    branches:
+      - main
+      - dev
+      - 'release/**'
+      - 'feature/**'
+  pull_request:
+    branches:
+      - dev
+      - 'release/**'
+  workflow_dispatch: {}
+
+env:
+  PNPM_VERSION: 10
+  NODE_VERSION: '20'
+  RUST_TOOLCHAIN: stable
+
+jobs:
+  #################################################################
+  # 1.  Fast checks on every push / PR
+  #################################################################
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: ⬇️ Checkout code
+        uses: actions/checkout@v4
+
+      - name: 🟢 Set‑up Node ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+
+      - name: 🟣 Set‑up pnpm ${{ env.PNPM_VERSION }} & install deps
+        uses: pnpm/action-setup@v2
+        with:
+          version: ${{ env.PNPM_VERSION }}
+          run_install: true
+
+      - name: 🪶 Lint
+        run: pnpm lint --if-present
+
+      - name: 🧪 Unit tests
+        run: pnpm test --if-present
+
+  #################################################################
+  # 2.  Semantic‑release (multi‑branch channels)
+  #################################################################
+  release:
+    needs: validate
+    runs-on: ubuntu-latest
+    # Only proceed on branches that are part of the flow
+    if: |
+      github.ref == 'refs/heads/main' ||
+      github.ref == 'refs/heads/dev' ||
+      startsWith(github.ref, 'refs/heads/release/')
+    outputs:
+      new_tag: ${{ steps.semantic.outputs.new_release_version }}
+      release_id: ${{ steps.semantic.outputs.release_id }}
+    steps:
+      - name: ⬇️ Checkout (full history needed for changelog)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 🟢 Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+
+      - name: 🟣 pnpm install
+        uses: pnpm/action-setup@v2
+        with:
+          version: ${{ env.PNPM_VERSION }}
+          run_install: true
+
+      - name: 🚀 semantic‑release (beta ▸ rc ▸ stable)
+        id: semantic
+        uses: cycjimmy/semantic-release-action@v4
+        with:
+          # Branch mapping:
+          #   dev          → prerelease "beta"
+          #   release/*    → prerelease "rc"
+          #   main         → stable
+          branches: |
+            [
+              "main",
+              {"name": "dev", "prerelease": "beta"},
+              {"name": "release/*", "prerelease": "rc"}
+            ]
+          additional_plugins: |
+            @semantic-release/changelog
+            @semantic-release/git
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  #################################################################
+  # 3.  Build desktop bundles when a tag has just been released
+  #################################################################
+  build:
+    needs: release
+    if: needs.release.outputs.new_tag != ''
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-14]
+    runs-on: ${{ matrix.os }}
+    env:
+      APP_VERSION: ${{ needs.release.outputs.new_tag }}
+    steps:
+      - name: ⬇️ Checkout tagged ref
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release.outputs.new_tag }}
+
+      - name: 🦀 Rust toolchain
+        uses: tauri-apps/tauri-action/setup-rust@v2
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: 🟢 Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+
+      - name: 🟣 pnpm install
+        uses: pnpm/action-setup@v2
+        with:
+          version: ${{ env.PNPM_VERSION }}
+          run_install: true
+
+      - name: 🏗️ Build Tauri v2 bundle
+        uses: tauri-apps/tauri-action@v2
+        with:
+          tagName: ${{ needs.release.outputs.new_tag }}
+          releaseId: ${{ needs.release.outputs.release_id }}
+
+      - name: 📦 Upload artefact (${ matrix.os })
+        uses: actions/upload-artifact@v4
+        with:
+          name: tauri-${{ matrix.os }}-${{ needs.release.outputs.new_tag }}
+          path: src-tauri/target/release/bundle/**/*
+
+  #################################################################
+  # 4.  Attach artefacts to GitHub Release (auto‑flags pre‑releases)
+  #################################################################
+  publish:
+    needs: [build, release]
+    if: needs.release.outputs.new_tag != ''
+    runs-on: ubuntu-latest
+    steps:
+      - name: ⬇️ Download all bundles
+        uses: actions/download-artifact@v4
+        with:
+          pattern: tauri-*-${{ needs.release.outputs.new_tag }}
+          merge-multiple: true
+          path: dist
+
+      - name: 🔍 Determine if version is a pre‑release
+        id: flags
+        run: |
+          if [[ "${{ needs.release.outputs.new_tag }}" == *-* ]]; then
+            echo "is_pre=true" >> $GITHUB_OUTPUT
+          else
+            echo "is_pre=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: 🚚 Upload assets to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.release.outputs.new_tag }}
+          prerelease: ${{ steps.flags.outputs.is_pre }}
+          files: dist/**
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
